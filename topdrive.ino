@@ -1,7 +1,9 @@
 // HARDCORE HENRY DRIVE — top-down GPS-speed driver for the Elecrow ES3C35P (ESP32-S3)
 // Portrait 320x480. Road scrolls at real GPS speed. Parked = parked.
-// TAP BOOT = change lane. LONG-PRESS BOOT = swap vehicle (FIT / CLASS C RV).
+// TAP BOOT = change lane (while driving). LONG-PRESS BOOT = swap vehicle (FIT / RV / PICKUP).
 // No GPS fix -> gentle auto-cruise.
+// GPS speed states: <10mph PARKED on the shoulder (traffic flows past),
+// 15mph PULL OUT (merge), 16mph+ DRIVING, back to PARKED at 10mph.
 // GPS: NEO-6M on RX45 / TX46, 9600 baud.
 // SD: 4-bit SDIO on CLK=5 CMD=4 D0=6 D1=7 D2=2 D3=3. Logs GPS locations + speed.
 // 2026-10-16: optimized draw, full RMC parse (lat/lon/time/speed), SD CSV log,
@@ -109,10 +111,10 @@ ESP_PANEL_LCD_CMD_WITH_NONE_PARAM(0, 0x21), // INVON
 #define LANES 3
 #define LANE_W (ROAD_W / LANES)
 #define CAR_Y (SCR_H - 130)
-static int vehicle = 0;  // 0 = Honda Fit, 1 = Class C RV
-static const char *VEH_NAMES[] = {"FIT", "RV"};
+static int vehicle = 0;  // 0 = Honda Fit, 1 = Class C RV, 2 = Pickup
+static const char *VEH_NAMES[] = {"FIT", "RV", "PICKUP"};
 static int vehHalfW() { return vehicle == 1 ? 18 : 16; }
-static int vehHalfH() { return vehicle == 1 ? 42 : 28; }
+static int vehHalfH() { return vehicle == 1 ? 42 : (vehicle == 2 ? 30 : 28); }
 
 // ---- framebuffer ----
 static uint8_t *fb;
@@ -160,6 +162,8 @@ static const uint8_t F5X7[][6] = {
   {'V', 0x1F,0x20,0x40,0x20,0x1F}, {'F', 0x7F,0x09,0x09,0x09,0x01},
   {'I', 0x00,0x41,0x7F,0x41,0x00}, {'T', 0x01,0x01,0x7F,0x01,0x01},
   {'L', 0x7F,0x40,0x40,0x40,0x40}, {'N', 0x7F,0x04,0x08,0x10,0x7F},
+  {'A', 0x7E,0x11,0x11,0x11,0x7E}, {'D', 0x7F,0x41,0x41,0x22,0x1C},
+  {'O', 0x3E,0x41,0x41,0x41,0x3E}, {'U', 0x7F,0x40,0x40,0x40,0x7F},
 };
 static const uint8_t *glyphFor(char c) {
   for (unsigned i = 0; i < sizeof(F5X7) / sizeof(F5X7[0]); i++)
@@ -265,6 +269,13 @@ static void logGPS() {
     f.close();
   }
 }
+
+// ---- drive states (GPS speed) ----
+enum DState { ST_PARKED, ST_PULLOUT, ST_DRIVING };
+static DState dstate = ST_PARKED;
+static uint32_t pulloutT = 0;
+static float tripMiles = 0;
+static int playerX = 0;
 
 // ---- world state ----
 static float roadOff = 0;
@@ -382,6 +393,34 @@ static void drawRv(int cx, int cy) {
   for (int i = 0; i < h; i++) { setPx(x, y + i, dark); setPx(x + w - 1, y + i, dark); }
 }
 
+// Pickup — crew cab, open bed, GBA-style shading + outlines.
+static void drawPickup(int cx, int cy) {
+  int w = 28, h = 56;
+  int x = cx - w / 2, y = cy - h / 2;
+  uint16_t body = rgb565(40, 90, 160);
+  uint16_t shade = rgb565(28, 62, 116);
+  uint16_t glass = rgb565(110, 150, 180);
+  uint16_t dark = rgb565(18, 18, 22);
+  uint16_t bed = rgb565(20, 44, 88);
+  fillRect(x - 3, y + 8, 5, 10, dark);
+  fillRect(x + w - 2, y + 8, 5, 10, dark);
+  fillRect(x - 3, y + h - 18, 5, 10, dark);
+  fillRect(x + w - 2, y + h - 18, 5, 10, dark);
+  fillRect(x, y, w, h, body);
+  fillRect(x, y + 4, 3, h - 8, shade);
+  fillRect(x + w - 3, y + 4, 3, h - 8, shade);
+  fillRect(x + 5, y + 7, w - 10, 8, glass);
+  fillRect(x + 4, y + 16, w - 8, 6, body);
+  fillRect(x + 3, y + 24, w - 6, h - 30, bed);
+  fillRect(x + 3, y + 24, w - 6, 3, shade);
+  fillRect(x + 3, y - 1, 5, 3, rgb565(255, 245, 160));
+  fillRect(x + w - 8, y - 1, 5, 3, rgb565(255, 245, 160));
+  fillRect(x + 3, y + h - 2, 5, 3, rgb565(190, 40, 40));
+  fillRect(x + w - 8, y + h - 2, 5, 3, rgb565(190, 40, 40));
+  for (int i = 0; i < w; i++) { setPx(x + i, y, dark); setPx(x + i, y + h - 1, dark); }
+  for (int i = 0; i < h; i++) { setPx(x, y + i, dark); setPx(x + w - 1, y + i, dark); }
+}
+
 // ---- radios -> roadside items ----
 // Every newly-seen BLE device spawns a roadside item: named devices become
 // billboards carrying the device name, unnamed ones become signal pylons.
@@ -486,6 +525,28 @@ static void radioPoll(uint32_t now) {
   if (!s->isScanning()) { s->clearResults(); s->start(4, nullptr, false); }
 }
 
+// true if no car (player or traffic) is near (lane, y)
+static bool laneClear(int lane, float y, int self) {
+  int cx = ROAD_X + LANE_W * lane + LANE_W / 2;
+  if (dstate == ST_DRIVING || dstate == ST_PULLOUT) {
+    int pcx = ROAD_X + (int)(LANE_W * laneF) + LANE_W / 2;
+    if (abs(cx - pcx) < 44 && abs((int)y - CAR_Y) < 110) return false;
+  }
+  for (int j = 0; j < 5; j++) {
+    if (j == self) continue;
+    int jcx = ROAD_X + LANE_W * traf[j].lane + LANE_W / 2;
+    if (abs(cx - jcx) < 44 && abs((int)traf[j].y - (int)y) < 120) return false;
+  }
+  return true;
+}
+// pick a random clear lane for a spawn at y; -1 if all blocked
+static int pickLane(int self, float y) {
+  int order[3] = {0, 1, 2};
+  for (int i = 0; i < 3; i++) { int j = rand() % 3, t = order[i]; order[i] = order[j]; order[j] = t; }
+  for (int i = 0; i < 3; i++) if (laneClear(order[i], y, self)) return order[i];
+  return -1;
+}
+
 static void render(float dt) {
   uint16_t grass = rgb565(22, 68, 26);
   uint16_t roadC = rgb565(46, 46, 50);
@@ -507,7 +568,7 @@ static void render(float dt) {
       fillCircle((int)trees[i].x, ty, trees[i].r / 2, rgb565(55, 145, 65));
     }
   }
-  int pcx = ROAD_X + (int)(LANE_W * laneF) + LANE_W / 2;
+  int pcx = playerX;
   bool hit = false;
   for (int i = 0; i < 5; i++) {
     int cx = ROAD_X + LANE_W * traf[i].lane + LANE_W / 2;
@@ -517,6 +578,7 @@ static void render(float dt) {
   }
   drawRItems(millis());
   if (vehicle == 1) drawRv(pcx, CAR_Y);
+  else if (vehicle == 2) drawPickup(pcx, CAR_Y);
   else drawFit(pcx, CAR_Y);
   if (hit) {
     int hw = vehHalfW(), hh = vehHalfH();
@@ -530,6 +592,14 @@ static void render(float dt) {
   else snprintf(buf, sizeof(buf), "--");
   drawText(12, 12, buf, 0xFFFF, 4);
   drawText(12, 44, "MPH", rgb565(160, 160, 160), 2);
+  char tbuf[16];
+  snprintf(tbuf, sizeof(tbuf), "%.1f MI", tripMiles);
+  drawText(12, 66, tbuf, rgb565(160, 160, 160), 2);
+  drawText(12, 88, gpsTime, rgb565(160, 160, 160), 2);
+  const char *stTxt = dstate == ST_PARKED ? "PARKED" : (dstate == ST_PULLOUT ? "PULL OUT" : "DRIVING");
+  uint16_t stCol = dstate == ST_PARKED ? rgb565(230, 180, 60)
+                 : (dstate == ST_PULLOUT ? rgb565(230, 230, 90) : rgb565(90, 220, 120));
+  drawText(12, 110, stTxt, stCol, 2);
   uint16_t dot = haveGps ? (gpsMphSmooth > 1.0f ? 0x07E0 : 0xFDA0) : 0xF800;
   fillRect(SCR_W - 18, 14, 8, 8, dot);
   char ln[8];
@@ -555,12 +625,19 @@ static void drawSplash() {
   heap_caps_free(band);
 }
 
+// Push like the splash does: 48-row 4-aligned bands via a temp buffer.
+static uint8_t *pushBand = nullptr;
 static void pushFrame() {
-  const int ROWS = 50;
+  const int ROWS = 48;
+  if (!pushBand) {
+    pushBand = (uint8_t *)heap_caps_malloc(SCR_W * ROWS * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!pushBand) return;
+  }
   for (int y = 0; y < SCR_H; y += ROWS) {
     int h = SCR_H - y;
     if (h > ROWS) h = ROWS;
-    lcd->drawBitmap(0, y, SCR_W, h, &fb[(y * SCR_W) * 2]);
+    memcpy(pushBand, &fb[(y * SCR_W) * 2], SCR_W * h * 2);
+    lcd->drawBitmap(0, y, SCR_W, h, pushBand);
   }
 }
 
@@ -618,10 +695,11 @@ void setup() {
   uint16_t tcol[5] = { rgb565(60,120,220), rgb565(80,200,120), rgb565(220,200,60),
                        rgb565(200,200,200), rgb565(150,90,220) };
   for (int i = 0; i < 5; i++) {
-    traf[i].lane = rand() % LANES;
     traf[i].y = rand() % SCR_H;
     traf[i].spd = 40 + rand() % 110;
     traf[i].col = tcol[i];
+    int nl = pickLane(i, traf[i].y);
+    traf[i].lane = nl >= 0 ? nl : rand() % LANES;
   }
 }
 
@@ -643,7 +721,27 @@ void loop() {
   }
 
   bool haveGps = gpsFix && now - gpsLast < 5000;
-  float target = haveGps ? gpsMphSmooth * 4.8f : 55.0f;
+
+  // GPS speed state machine: PARKED (<10) -> PULL OUT (15) -> DRIVING (16+)
+  if (haveGps) {
+    if (dstate == ST_PARKED && gpsMphSmooth >= 15.0f) { dstate = ST_PULLOUT; pulloutT = now; }
+    else if (dstate == ST_PULLOUT) {
+      if (gpsMphSmooth <= 10.0f) dstate = ST_PARKED;
+      else if (now - pulloutT >= 1800) dstate = ST_DRIVING;
+    }
+    else if (dstate == ST_DRIVING && gpsMphSmooth <= 10.0f) dstate = ST_PARKED;
+  } else {
+    dstate = ST_DRIVING;  // no fix: gentle auto-cruise as before
+  }
+  if (haveGps) tripMiles += gpsMphSmooth * dt / 3600.0f;
+
+  float target;
+  if (!haveGps) target = 55.0f;
+  else if (dstate == ST_PARKED) target = 0;
+  else if (dstate == ST_PULLOUT) {
+    float k = (now - pulloutT) / 1800.0f; if (k > 1) k = 1; if (k < 0) k = 0;
+    target = gpsMphSmooth * 4.8f * k;
+  } else target = gpsMphSmooth * 4.8f;
   if (target > 350.0f) target = 350.0f;
   pxs += (target - pxs) * (dt < 1 ? dt * 2.0f : 1.0f);
 
@@ -651,11 +749,20 @@ void loop() {
   if (btn && !prevBtn) {
     pressStart = now;
   } else if (!btn && prevBtn) {
-    if (now - pressStart >= 600) vehicle = (vehicle + 1) % 2;
-    else if (now - lastBtn > 400) { lastBtn = now; laneT = (laneT + 1) % LANES; }
+    if (now - pressStart >= 600) vehicle = (vehicle + 1) % 3;
+    else if (dstate == ST_DRIVING && now - lastBtn > 400) { lastBtn = now; laneT = (laneT + 1) % LANES; }
   }
   prevBtn = btn;
   laneF += (laneT - laneF) * (dt < 1 ? dt * 6.0f : 1.0f);
+
+  // player x: shoulder when parked, merge lane when pulling out
+  int shoulderX = ROAD_X + ROAD_W + 18;
+  int laneX = ROAD_X + (int)(LANE_W * laneF) + LANE_W / 2;
+  if (dstate == ST_PARKED) playerX = shoulderX;
+  else if (dstate == ST_PULLOUT) {
+    float k = (now - pulloutT) / 1800.0f; if (k > 1) k = 1; if (k < 0) k = 0;
+    playerX = shoulderX + (int)((laneX - shoulderX) * k);
+  } else playerX = laneX;
 
   roadOff += pxs * dt;
 
@@ -668,19 +775,21 @@ void loop() {
     }
   }
   bool nearHit = false;
-  int pcx2 = ROAD_X + (int)(LANE_W * laneF) + LANE_W / 2;
   for (int i = 0; i < 5; i++) {
     traf[i].y += (pxs - traf[i].spd) * dt;
-    if (abs((int)(ROAD_X + LANE_W * traf[i].lane + LANE_W / 2) - pcx2) < vehHalfW() &&
+    if (dstate != ST_PARKED &&
+        abs((int)(ROAD_X + LANE_W * traf[i].lane + LANE_W / 2) - playerX) < vehHalfW() &&
         abs((int)traf[i].y - CAR_Y) < vehHalfH()) nearHit = true;
     if (traf[i].y > SCR_H + 70) {
       traf[i].y = -70;
-      traf[i].lane = rand() % LANES;
       traf[i].spd = 40 + rand() % 110;
+      int nl = pickLane(i, -70);
+      if (nl >= 0) traf[i].lane = nl; else traf[i].y = -160;  // blocked: wait
     } else if (traf[i].y < -70) {
       traf[i].y = SCR_H + 70;
-      traf[i].lane = rand() % LANES;
       traf[i].spd = 40 + rand() % 110;
+      int nl = pickLane(i, SCR_H + 70);
+      if (nl >= 0) traf[i].lane = nl; else traf[i].y = SCR_H + 160;  // blocked: wait
     }
   }
 
